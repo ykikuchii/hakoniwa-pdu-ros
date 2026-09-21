@@ -12,6 +12,7 @@ survived, and a value-only assertion does not discriminate at all
 (`bytes([0, 1, 2])` already equals what the fixed mapper stores).
 """
 
+import array
 import sys
 import types
 import unittest
@@ -51,6 +52,16 @@ def _install_fake_octet_modules() -> None:
         def get_fields_and_field_types(cls) -> dict:
             return {"data": "sequence<uint16>"}
 
+    class BoundedBag:
+        """Bounded nested array: parsing the bound off is follow-up scope."""
+
+        def __init__(self) -> None:
+            self.items = []
+
+        @classmethod
+        def get_fields_and_field_types(cls) -> dict:
+            return {"items": "sequence<octet_test_msgs/Item, 4>"}
+
     class Undeclared:
         """Declares a message element type its package does not provide."""
 
@@ -61,7 +72,7 @@ def _install_fake_octet_modules() -> None:
         def get_fields_and_field_types(cls) -> dict:
             return {"items": "sequence<octet_test_msgs/Missing>"}
 
-    for cls in (Item, Bag, Widened, Undeclared):
+    for cls in (Item, Bag, BoundedBag, Widened, Undeclared):
         setattr(pkg_msg, cls.__name__, cls)
     pkg.msg = pkg_msg
     sys.modules["octet_test_msgs"] = pkg
@@ -79,7 +90,9 @@ class _SourceItem:
 
     def __init__(self, kind: int = 0, data=()) -> None:
         self.kind = kind
-        self.data = list(data)
+        # Stored as given. Coercing to a list here would make every shape in
+        # the shapes test arrive as a list, so that test would assert nothing.
+        self.data = data
 
 
 class _SourceBag:
@@ -109,6 +122,8 @@ class OctetSequenceTest(unittest.TestCase):
             (0, 1, 2),
             b"\x00\x01\x02",
             bytearray(b"\x00\x01\x02"),
+            memoryview(b"\x00\x01\x02"),
+            array.array("B", [0, 1, 2]),
             [b"\x00", b"\x01", b"\x02"],
         )
         for payload in shapes:
@@ -194,6 +209,17 @@ class NestedMessageArrayTest(unittest.TestCase):
             self.assertIsInstance(item, Item)
         self.assertEqual(bytes(target.items[0].data), b"\x01\x02")
         self.assertEqual(bytes(target.items[1].data), b"")
+
+    def test_bounded_declaration_keeps_its_previous_handling(self) -> None:
+        from octet_test_msgs.msg import BoundedBag
+
+        # "sequence<pkg/Type, N>" still reads as the element type "pkg/Type, N"
+        # here, because parsing the bound off went to the follow-up. What this
+        # pins is that the resolution added by this PR does not turn that into
+        # an error: the copy goes through as it did before.
+        target = BoundedBag()
+        _copy_matching_fields(_SourceBag([_SourceItem(1, [1, 2])]), target)
+        self.assertEqual(len(target.items), 1)
 
     def test_unresolvable_declared_element_type_is_reported(self) -> None:
         from octet_test_msgs.msg import Undeclared

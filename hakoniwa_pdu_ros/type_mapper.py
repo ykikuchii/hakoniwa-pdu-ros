@@ -141,21 +141,25 @@ def _is_octet_sequence_field(obj: object, field_name: str) -> bool:
 def _octet_values(value) -> list | None:
     """Integer value of each element, or None when the shape is not recognised.
 
-    A byte[] field legitimately arrives as a bytes-like object, or as a
-    sequence of ints or one-byte bytes objects. Anything else is left for the
-    existing handling to deal with exactly as before: this normalisation only
-    changes the representation of payloads it can read without guessing, and
-    never turns a value the mapper used to pass through into an error.
+    A byte[] field legitimately arrives as a bytes-like object, or as any
+    sequence of ints or one-byte bytes objects -- a list, a tuple, or the
+    array.array a generated PDU type hands over. All of those are normalised.
 
-    Rejecting malformed elements instead of passing them through would be a
-    change to that contract, so it belongs in a follow-up rather than here.
+    Anything else is left untouched for the existing handling to deal with, so
+    a payload this cannot read keeps whatever treatment it had before rather
+    than becoming an error. Rejecting malformed elements is a change to that
+    treatment and belongs in a follow-up, not here.
     """
     if isinstance(value, (bytes, bytearray, memoryview)):
         return list(bytes(value))
-    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+    if isinstance(value, str):
+        return None
+    try:
+        elements = list(value)
+    except TypeError:
         return None
     values = []
-    for element in value:
+    for element in elements:
         if isinstance(element, (bytes, bytearray)):
             if len(element) != 1:
                 return None
@@ -229,6 +233,13 @@ def _list_item_type(dst_parent: object, field_name: str):
         return None
     inner = _primitive_sequence_type(declared)
     if inner is None or "/" not in inner:
+        return None
+    if "," in inner:
+        # A bounded declaration, `sequence<pkg/Type, N>`, still reads as
+        # "pkg/Type, N" here: parsing the bound off is follow-up scope. Falling
+        # back leaves a bounded nested array exactly as it was handled before,
+        # which is what this PR promises; raising below would instead turn a
+        # valid declaration into an error the mapper never used to raise.
         return None
     package_name, _, message_name = inner.partition("/")
     # A declared message element type that cannot be resolved is reported
