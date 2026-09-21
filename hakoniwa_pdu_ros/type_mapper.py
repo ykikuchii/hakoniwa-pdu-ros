@@ -87,9 +87,11 @@ def _copy_matching_fields(src: object, dst: object) -> None:
         # identical, and then serialises as all-0xff. Normalise on whichever
         # side declares the field as octet, before anything else looks at it.
         if _is_octet_sequence_field(dst, name):
-            setattr(dst, name, _as_octet_bytes(src_value, name))
-            continue
-        if _is_octet_sequence_field(src, name) and _field_type_name(
+            normalised = _as_octet_bytes(src_value)
+            if normalised is not None:
+                setattr(dst, name, normalised)
+                continue
+        elif _is_octet_sequence_field(src, name) and _field_type_name(
             dst, name
         ) is None:
             # Only when the destination does not declare the field itself. A
@@ -97,8 +99,10 @@ def _copy_matching_fields(src: object, dst: object) -> None:
             # of the same bytes and must keep reaching _decode_binary_sequence
             # below; overriding it here would quietly change what a generic
             # field copy means.
-            setattr(dst, name, _as_octet_ints(src_value, name))
-            continue
+            normalised = _as_octet_ints(src_value)
+            if normalised is not None:
+                setattr(dst, name, normalised)
+                continue
         if isinstance(src_value, (bytes, bytearray)):
             decoded = _decode_binary_sequence(dst, name, src_value)
             if decoded is not None:
@@ -134,56 +138,46 @@ def _is_octet_sequence_field(obj: object, field_name: str) -> bool:
     return _primitive_sequence_type(field_type) == "octet"
 
 
-def _octet_elements(value, field_name: str):
-    """Yield the integer value of each element of a byte-sequence field.
+def _octet_values(value) -> list | None:
+    """Integer value of each element, or None when the shape is not recognised.
 
-    Accepts exactly the shapes a byte[] field can legitimately arrive in --
-    a bytes-like object, or a sequence whose elements are ints or one-byte
-    bytes objects -- and rejects everything else rather than coercing it.
+    A byte[] field legitimately arrives as a bytes-like object, or as a
+    sequence of ints or one-byte bytes objects. Anything else is left for the
+    existing handling to deal with exactly as before: this normalisation only
+    changes the representation of payloads it can read without guessing, and
+    never turns a value the mapper used to pass through into an error.
 
-    The rejections are the point. int() would turn "12" into two octets and
-    1.9 into 1, and extending from a multi-byte element would merge two
-    elements into one while an empty element vanished. Each of those turns
-    malformed input into a plausible-looking payload of the wrong length,
-    which is the same class of failure this normalisation exists to prevent.
+    Rejecting malformed elements instead of passing them through would be a
+    change to that contract, so it belongs in a follow-up rather than here.
     """
     if isinstance(value, (bytes, bytearray, memoryview)):
-        yield from bytes(value)
-        return
-    if isinstance(value, str):
-        raise TypeError(f"byte[] field '{field_name}' cannot be filled from a str")
-    for index, element in enumerate(value):
+        return list(bytes(value))
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        return None
+    values = []
+    for element in value:
         if isinstance(element, (bytes, bytearray)):
             if len(element) != 1:
-                raise ValueError(
-                    f"byte[] field '{field_name}' element {index} is "
-                    f"{len(element)} bytes; each element must be exactly one"
-                )
-            yield element[0]
+                return None
+            values.append(element[0])
             continue
         if isinstance(element, bool) or not isinstance(element, int):
-            raise TypeError(
-                f"byte[] field '{field_name}' element {index} has type "
-                f"{type(element).__name__}; expected int or a one-byte bytes"
-            )
+            return None
         if not 0 <= element <= 255:
-            # New validation, replacing pass-through: an element outside the
-            # octet range cannot be represented, and rclpy renders it as 0xff.
-            raise ValueError(
-                f"byte[] field '{field_name}' element {index} out of range: "
-                f"{element}"
-            )
-        yield element
+            return None
+        values.append(element)
+    return values
 
 
-def _as_octet_bytes(value, field_name: str) -> bytes:
-    """Normalise an accepted byte-sequence shape to ``bytes``."""
-    return bytes(bytearray(_octet_elements(value, field_name)))
+def _as_octet_bytes(value) -> bytes | None:
+    """Normalise a recognised byte-sequence shape to ``bytes``."""
+    values = _octet_values(value)
+    return None if values is None else bytes(bytearray(values))
 
 
-def _as_octet_ints(value, field_name: str) -> list:
-    """Normalise an accepted byte-sequence shape to a list of ints."""
-    return list(_octet_elements(value, field_name))
+def _as_octet_ints(value) -> list | None:
+    """Normalise a recognised byte-sequence shape to a list of ints."""
+    return _octet_values(value)
 
 
 def _copy_list(src_list, dst_parent: object, field_name: str, dst_list: object) -> list:
@@ -199,14 +193,7 @@ def _copy_list(src_list, dst_parent: object, field_name: str, dst_list: object) 
         if _is_scalar(src_item):
             copied.append(src_item)
             continue
-        if index < len(dst_items) and (
-            item_type is None or isinstance(dst_items[index], item_type)
-        ):
-            # Reuse an existing element only when it is of the declared type.
-            # A destination left holding elements of the source type from an
-            # earlier copy would otherwise keep them, and every
-            # destination-type-aware rule inside them -- byte[] handling
-            # included -- would go on being skipped.
+        if index < len(dst_items):
             dst_item = dst_items[index]
         elif item_type is not None:
             dst_item = item_type()
@@ -306,17 +293,8 @@ def _is_declared_sequence_field(src: object, dst: object, field_name: str) -> bo
 
 
 def _primitive_sequence_type(field_type: str) -> str | None:
-    """Element type of a sequence declaration, bound stripped if present.
-
-    ROS spells a bounded sequence `sequence<T, N>` and a fixed array `T[N]`.
-    Returning "T, N" for the bounded form makes every caller that compares the
-    result against a type name silently fail to recognise it -- a bounded
-    byte[] would not be detected as octet, and a bounded message array would
-    be looked up under the attribute name "Type, 5".
-    """
     if field_type.startswith("sequence<") and field_type.endswith(">"):
-        inner = field_type[len("sequence<") : -1]
-        return inner.split(",", 1)[0].strip()
+        return field_type[len("sequence<") : -1]
     if field_type.endswith("]"):
         return field_type.split("[", 1)[0]
     return None

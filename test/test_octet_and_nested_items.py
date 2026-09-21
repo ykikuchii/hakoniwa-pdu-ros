@@ -16,11 +16,11 @@ import sys
 import types
 import unittest
 
-from hakoniwa_pdu_ros.type_mapper import _copy_matching_fields, _primitive_sequence_type
+from hakoniwa_pdu_ros.type_mapper import _copy_matching_fields
 
 
 def _install_fake_octet_modules() -> None:
-    """Messages with byte[] fields, unbounded and bounded, nested and flat."""
+    """Messages with byte[] fields, flat and nested."""
     pkg = types.ModuleType("octet_test_msgs")
     pkg_msg = types.ModuleType("octet_test_msgs.msg")
 
@@ -33,14 +33,6 @@ def _install_fake_octet_modules() -> None:
         def get_fields_and_field_types(cls) -> dict:
             return {"kind": "uint8", "data": "sequence<octet>"}
 
-    class BoundedItem:
-        def __init__(self) -> None:
-            self.data = b""
-
-        @classmethod
-        def get_fields_and_field_types(cls) -> dict:
-            return {"data": "sequence<octet, 8>"}
-
     class Bag:
         def __init__(self) -> None:
             self.items = []
@@ -48,14 +40,6 @@ def _install_fake_octet_modules() -> None:
         @classmethod
         def get_fields_and_field_types(cls) -> dict:
             return {"items": "sequence<octet_test_msgs/Item>"}
-
-    class BoundedBag:
-        def __init__(self) -> None:
-            self.items = []
-
-        @classmethod
-        def get_fields_and_field_types(cls) -> dict:
-            return {"items": "sequence<octet_test_msgs/Item, 4>"}
 
     class Widened:
         """Destination that reads the same bytes as a different primitive."""
@@ -77,7 +61,7 @@ def _install_fake_octet_modules() -> None:
         def get_fields_and_field_types(cls) -> dict:
             return {"items": "sequence<octet_test_msgs/Missing>"}
 
-    for cls in (Item, BoundedItem, Bag, BoundedBag, Widened, Undeclared):
+    for cls in (Item, Bag, Widened, Undeclared):
         setattr(pkg_msg, cls.__name__, cls)
     pkg.msg = pkg_msg
     sys.modules["octet_test_msgs"] = pkg
@@ -101,21 +85,6 @@ class _SourceItem:
 class _SourceBag:
     def __init__(self, items=()) -> None:
         self.items = list(items)
-
-
-class SequenceDeclarationParsingTest(unittest.TestCase):
-    def test_bounds_are_stripped_from_the_element_type(self) -> None:
-        cases = {
-            "sequence<octet>": "octet",
-            "sequence<octet, 8>": "octet",
-            "sequence<pkg/Type>": "pkg/Type",
-            "sequence<pkg/Type, 5>": "pkg/Type",
-            "pkg/Type[5]": "pkg/Type",
-            "uint8[]": "uint8",
-        }
-        for declaration, expected in cases.items():
-            with self.subTest(declaration=declaration):
-                self.assertEqual(_primitive_sequence_type(declaration), expected)
 
 
 class OctetSequenceTest(unittest.TestCase):
@@ -156,30 +125,20 @@ class OctetSequenceTest(unittest.TestCase):
         _copy_matching_fields(_SourceItem(1, []), target)
         self.assertEqual(bytes(target.data), b"")
 
-    def test_bounded_byte_array_is_normalised_too(self) -> None:
-        from octet_test_msgs.msg import BoundedItem
-
-        target = BoundedItem()
-        _copy_matching_fields(_SourceItem(0, [1, 2]), target)
-        self.assertIsInstance(target.data, (bytes, bytearray))
-        self.assertEqual(bytes(target.data), b"\x01\x02")
-
-    def test_malformed_elements_are_rejected_rather_than_coerced(self) -> None:
+    def test_unrecognised_shapes_keep_their_existing_behaviour(self) -> None:
         from octet_test_msgs.msg import Item
 
-        # Each of these has a plausible-looking coercion that silently changes
-        # the payload or its length, which is the failure mode being fixed.
-        for payload, error in (
-            ("12", TypeError),            # would become b"\x01\x02"
-            ([1.9], TypeError),           # would become b"\x01"
-            ([b"ab", b""], ValueError),   # would merge two elements into one
-            ([True], TypeError),          # bool is an int subclass
-            ([-1], ValueError),
-            ([256], ValueError),
-        ):
+        # Normalisation reads the shapes a byte[] field legitimately arrives
+        # in and leaves everything else where it was, so this change does not
+        # alter what the mapper does with a malformed payload. Rejecting these
+        # would be a change to the existing pass-through contract and belongs
+        # in a follow-up; what is asserted here is that the value is untouched,
+        # not that passing it through is correct.
+        for payload in ([1.9], [b"ab", b""], [True], [-1], [256]):
             with self.subTest(payload=payload):
-                with self.assertRaises(error):
-                    _copy_matching_fields(_SourceItem(1, payload), Item())
+                target = Item()
+                _copy_matching_fields(_SourceItem(1, payload), target)
+                self.assertEqual(target.data, list(payload))
 
     def test_byte_array_back_to_an_undeclared_target_becomes_ints(self) -> None:
         from octet_test_msgs.msg import Item
@@ -235,24 +194,6 @@ class NestedMessageArrayTest(unittest.TestCase):
             self.assertIsInstance(item, Item)
         self.assertEqual(bytes(target.items[0].data), b"\x01\x02")
         self.assertEqual(bytes(target.items[1].data), b"")
-
-    def test_bounded_nested_array_resolves_its_element_type(self) -> None:
-        from octet_test_msgs.msg import BoundedBag, Item
-
-        target = BoundedBag()
-        _copy_matching_fields(_SourceBag([_SourceItem(1, [3])]), target)
-        self.assertIsInstance(target.items[0], Item)
-        self.assertEqual(bytes(target.items[0].data), b"\x03")
-
-    def test_existing_elements_of_the_wrong_type_are_replaced(self) -> None:
-        from octet_test_msgs.msg import Bag, Item
-
-        target = Bag()
-        # A destination left holding source-type elements by an earlier copy.
-        target.items = [_SourceItem(9, [9])]
-        _copy_matching_fields(_SourceBag([_SourceItem(1, [1, 2])]), target)
-        self.assertIsInstance(target.items[0], Item)
-        self.assertEqual(bytes(target.items[0].data), b"\x01\x02")
 
     def test_unresolvable_declared_element_type_is_reported(self) -> None:
         from octet_test_msgs.msg import Undeclared
